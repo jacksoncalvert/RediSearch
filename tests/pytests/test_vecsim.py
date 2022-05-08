@@ -152,6 +152,43 @@ def testDelReuse():
     res = [4, 'a', ['v', vecs[0]], 'b', ['v', vecs[1]], 'c', ['v', vecs[2]], 'd', ['v', vecs[3]]]
     env.expect('FT.SEARCH', 'idx', '*=>[KNN 4 @v $b]', 'PARAMS', '2', 'b', 'abcdefgh', 'RETURN', '1', 'v').equal(res)
 
+# test for issue https://github.com/RediSearch/RediSearch/pull/2705
+def testUpdateWithBadValue(env):
+    env = Env(moduleArgs = 'DEFAULT_DIALECT 2')
+    conn = getConnectionByEnv(env)
+    env.execute_command('FT.CREATE', 'idx', 'ON', 'JSON',
+                        'SCHEMA', '$.v', 'AS', 'vec', 'VECTOR', 'FLAT', '6', 'TYPE', 'FLOAT32', 'DIM', '2','DISTANCE_METRIC', 'L2')
+    env.execute_command('FT.CREATE', 'idx2',
+                        'SCHEMA', 'vec', 'VECTOR', 'FLAT', '6', 'TYPE', 'FLOAT32', 'DIM', '2','DISTANCE_METRIC', 'L2')
+
+    res = [1, 'doc:1', ['$', '{"v":[1,3]}']]
+    # Add doc contains a vector to the index
+    env.assertOk(conn.execute_command('JSON.SET', 'doc:1', '$', '{"v":[1,2]}'))
+    # Override with bad vector value (wrong blob size)
+    env.assertEqual(conn.execute_command('JSON.ARRINSERT', 'doc:1', '$.v', '2', '3'), [3])
+    # Override again with legal vector value
+    env.assertEqual(conn.execute_command('JSON.ARRPOP', 'doc:1', '$.v', '1'), ['2'])
+    env.assertEqual(conn.execute_command('JSON.GET', 'doc:1', '$.v[*]'), '[1,3]')
+    env.assertEqual(conn.execute_command('JSON.ARRLEN', 'doc:1', '$.v'), [2])
+    waitForIndex(env, 'idx')
+    # before the issue fix, the second query will result in empty result, as the first vector value was not deleted when
+    # its value was override with a bad value
+    env.expect('FT.SEARCH', 'idx', '*').equal(res)
+    env.expect('FT.SEARCH', 'idx', '*=>[KNN 1 @vec $B]', 'PARAMS', '2', 'B', '????????', 'RETURN', '1', '$').equal(res)
+
+    res = [1, 'h1', ['vec', '????>>>>']]
+    # Add doc contains a vector to the index
+    env.assertEqual(conn.execute_command('HSET', 'h1', 'vec', '????????'), 1)
+    # Override with bad vector value (wrong blob size)
+    env.assertEqual(conn.execute_command('HSET', 'h1', 'vec', 'bad-val'), 0)
+    # Override again with legal vector value
+    env.assertEqual(conn.execute_command('HSET', 'h1', 'vec', '????>>>>'), 0)
+    waitForIndex(env, 'idx2')
+    # before the issue fix, the second query will result in empty result, as the first vector value was not deleted when
+    # its value was override with a bad value
+    env.expect('FT.SEARCH', 'idx2', '*').equal(res)
+    env.expect('FT.SEARCH', 'idx2', '*=>[KNN 1 @vec $B]', 'PARAMS', '2', 'B', '????????', 'RETURN', '1', 'vec').equal(res)
+
 def load_vectors_to_redis(env, n_vec, query_vec_index, vec_size):
     env = Env(moduleArgs = 'DEFAULT_DIALECT 2')
     conn = getConnectionByEnv(env)
@@ -218,6 +255,43 @@ def testCreate():
     # env.execute_command('FT.CREATE', 'idx5', 'SCHEMA', 'v', 'VECTOR', 'FLAT', '6', 'TYPE', 'INT32', 'DIM', '64', 'DISTANCE_METRIC', 'COSINE')
     # info = [['identifier', 'v', 'attribute', 'v', 'type', 'VECTOR', 'ALGORITHM', 'FLAT', 'TYPE', 'INT32', 'DIM', '64', 'DISTANCE_METRIC', 'COSINE', 'BLOCK_SIZE', str(1024 * 1024)]]
     # assertInfoField(env, 'idx5', 'attributes', info)
+
+
+def test_create_multiple_vector_fields():
+    env = Env(moduleArgs = 'DEFAULT_DIALECT 2')
+    env.skipOnCluster()
+    dim = 2
+    conn = getConnectionByEnv(env)
+    # Create index with 2 vector fields, where the first is a prefix of the second.
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'HNSW', '6', 'TYPE', 'FLOAT32', 'DIM', dim, 'DISTANCE_METRIC', 'COSINE',
+               'v_flat', 'VECTOR', 'FLAT', '6', 'TYPE', 'FLOAT32', 'DIM', dim, 'DISTANCE_METRIC', 'L2').ok()
+
+    # Validate each index type.
+    info_data = env.cmd("FT.DEBUG", "VECSIM_INFO", "idx", "v")
+    env.assertEqual(info_data[:2], ['ALGORITHM', 'HNSW'])
+    info_data = env.cmd("FT.DEBUG", "VECSIM_INFO", "idx", "v_flat")
+    env.assertEqual(info_data[:2], ['ALGORITHM', 'FLAT'])
+
+    # Insert one vector only to each index, validate it was inserted only to the right index.
+    conn.execute_command('HSET', 'a', 'v', 'aaaaaaaa')
+    info_data = env.cmd("FT.DEBUG", "VECSIM_INFO", "idx", "v")
+    env.assertEqual(info_data[8:10], ['INDEX_SIZE', 1])
+    info_data = env.cmd("FT.DEBUG", "VECSIM_INFO", "idx", "v_flat")
+    env.assertEqual(info_data[8:10], ['INDEX_SIZE', 0])
+
+    conn.execute_command('HSET', 'b', 'v_flat', 'bbbbbbbb')
+    info_data = env.cmd("FT.DEBUG", "VECSIM_INFO", "idx", "v")
+    env.assertEqual(info_data[8:10], ['INDEX_SIZE', 1])
+    info_data = env.cmd("FT.DEBUG", "VECSIM_INFO", "idx", "v_flat")
+    env.assertEqual(info_data[8:10], ['INDEX_SIZE', 1])
+
+    # Search in every index once, validate it was performed only to the right index.
+    env.cmd('FT.SEARCH', 'idx', '*=>[KNN 2 @v $b]', 'PARAMS', '2', 'b', 'abcdefgh')
+    info_data = env.cmd("FT.DEBUG", "VECSIM_INFO", "idx", "v")
+    env.assertEqual(info_data[-2:], ['LAST_SEARCH_MODE', 'STANDARD_KNN'])
+    info_data = env.cmd("FT.DEBUG", "VECSIM_INFO", "idx", "v_flat")
+    env.assertEqual(info_data[-2:], ['LAST_SEARCH_MODE', 'EMPTY_MODE'])
+
 
 def testCreateErrors():
     env = Env(moduleArgs = 'DEFAULT_DIALECT 2')
